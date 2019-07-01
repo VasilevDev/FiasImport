@@ -1,149 +1,144 @@
-﻿using Npgsql;
-using System;
-using System.Data;
-using System.Linq;
+﻿using System;
 using System.Xml;
-using System.Xml.Linq;
-using System.Data;
-using System.Data.SqlClient;
-using System.Text;
 using System.Collections.Generic;
+using Npgsql;
+using SharpCompress.Archives;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 
 namespace FiasImport
 {
-	static class Extention
-	{
-		public static void ForeachAndForeachExceptLast<T>(this IEnumerable<T> source, Action<T> forEach, Action<T> forEachExceptLast = null)
-		{
-			using (var enumerator = source.GetEnumerator())
-			{
-				if (enumerator.MoveNext())
-				{
-					var item = enumerator.Current; ;
-
-					while (enumerator.MoveNext())
-					{
-						forEach(item);
-						if (forEachExceptLast != null)
-							forEachExceptLast(item);
-						item = enumerator.Current;
-					}
-					forEach(item);
-				}
-			}
-		}
-	}
-	
 	class Program
 	{
-		public static string GenerateInsertStatement(string table, Dictionary<string, object> data)
-		{
-			StringBuilder statement = new StringBuilder();
-
-			statement.Append($"INSERT INTO public.\"{table}\" (");
-
-			data.ForeachAndForeachExceptLast(column =>
-			{
-				statement.Append($"\"{column.Key}\"");
-			},
-				column =>
-				{
-					statement.Append(", ");
-				});
-
-			statement.Append($") VALUES(");
-
-			data.ForeachAndForeachExceptLast(column =>
-			{
-				statement.Append($"\'{column.Value}\'");
-			},
-				column =>
-				{
-					statement.Append(", ");
-				});
-
-			statement.Append($")");
-
-			statement.Append($" RETURNING \"RecID\"");
-
-			return statement.ToString();
-		}
-
-
+		/// <summary>
+		/// Основной метод выполнения импорта
+		/// </summary>
+		/// <param name="args"> Список аргументов
+		/// args[0] - Путь к файлу архива с XML файлами данных по ФИАС
+		/// args[1] - Строка подключения к БД
+		/// args[2] - Строка со списком названий таблиц перечисленных через запятую
+		/// </param>
 		static void Main(string[] args)
 		{
-			XmlReader reader = XmlReader.Create(@"AS_ADDROBJ_20171217_33bb6037-d55f-49e1-bb44-b24e834a7ff5.XML");
-
-			NpgsqlConnection conn = new NpgsqlConnection("server=localhost;port=5432;user id=postgres;password=postgres;database=fias");
-			conn.Open();
-
-			IDbCommand command = conn.CreateCommand();
-
-
-
-			// Define a query
-			//NpgsqlCommand command = new NpgsqlCommand("SELECT city, state FROM cities", conn);
-
-			// Execute the query and obtain a result set
-			//NpgsqlDataReader dr = command.ExecuteReader();
-
-			// Output rows
-			//while (dr.Read())
-			//	Console.Write("{0}\t{1} \n", dr[0], dr[1]);
-
-
-
-			//XmlDocument document = new XmlDocument();
-			//document.Load(@"AS_ADDROBJ_20171217_33bb6037-d55f-49e1-bb44-b24e834a7ff5.XML");
-			//Console.WriteLine(document.ChildNodes.Count);
-			
-
-			var dict = new Dictionary<string, object>();
-			var count = 0;
-			while (reader.Read())
+			try
 			{
-				if (reader.IsStartElement())
+				if (args == null || args.Length != 3)
+					throw new ArgumentException("Количество параметров не соответствует ожидаемому. " +
+						"Ожидалось три параметра: 1- Путь к архиву справочника, 2 - Строка подключения к БД, " +
+						"3 - Список названий таблиц, в которые необходимо импортировать данные");
+
+				// Путь до архива с файлами данных по ФИАС
+				string fiasArchivePath = args[0];
+
+				// Проверим, что файл архива существует
+				if (!File.Exists(fiasArchivePath))
+					throw new FileNotFoundException($"Не удалось найти архив с файлами данных ФИАС по адресу {fiasArchivePath}");
+
+				// Получаем список таблиц в которые будем производить импорт данных
+				List<string> tables = args[2]?.Replace(" ", "")?.Split(',')?.ToList();
+
+				if (tables == null)
+					throw new ArgumentException("Не удалось получить список таблиц для импорта. Убедитесь, что верно заданны параметры приложения");
+
+				if (!tables.Any())
+					throw new ArgumentNullException("Список таблиц для импорта данных - пуст");
+
+				using (var connection = new NpgsqlConnection(args[1]))
+				using (var command = new NpgsqlCommand())
 				{
-					if (reader.IsEmptyElement) { }
-					//Console.WriteLine("<{0}/>", reader.Name);
-					else
-					{
-						//Console.Write("<{0}> ", reader.Name);
-						reader.Read(); // Read the start tag.
-						if (reader.IsStartElement()) { }  // Handle nested elements.
-														  //Console.Write("\r\n<{0}>", reader.Name);
-														  //Console.WriteLine(reader.ReadString());  //Read the text content of the element.
-					}
+					connection.Open();
+					command.Connection = connection;
 
-					if (reader.HasAttributes)
+					// Открываем архив с файлами данных по ФИАС
+					using (var archive = ArchiveFactory.Open(fiasArchivePath))
 					{
-						//Console.WriteLine("Attributes of <" + reader.Name + ">");
-						
-						while (reader.MoveToNextAttribute())
+						// Цикл обхода архива с XML файлами с данными ФИАС
+						foreach (var entry in archive.Entries)
 						{
-							dict.Add(reader.Name, reader.Value);
-							//Console.WriteLine(" {0}={1}", reader.Name, reader.Value);
+							// Название таблицы полученное из название файла
+							// Например файл называется AS_ADDROBJ_20171217_33bb6037-d55f-49e1-bb44-b24e834a7ff5.XML
+							// из него получаем ADDROBJ
+							string tableName = entry.Key.Split('_')[1];
+
+							// Импортируем только нужные таблицы
+							if (!tables.Contains(tableName)) continue;
+
+							// Открываем поток на чтение XML файла ФИАС
+							using (var stream = entry.OpenEntryStream())
+							{
+								XmlReader reader = XmlReader.Create(stream);
+
+								Console.WriteLine($"Запущен процесс импорта таблицы {tableName}");
+
+								var timer = new Stopwatch();
+								timer.Start();
+
+								// Цикл обхода XML файла ФИАС
+								while (reader.Read())
+								{
+									if (reader.NodeType == XmlNodeType.Element)
+									{
+										// Атрибуты и их значения представляют собой название поля в таблице и значение соответственно
+										if (reader.HasAttributes)
+										{
+											var record = new Dictionary<string, object>();
+
+											// Цикл обхода всех полей записи таблицы
+											while (reader.MoveToNextAttribute())
+											{
+												string fieldName = reader.Name.ToLower();
+												string fieldValue = $"'{reader.Value.ToLower()}'";
+
+												record[fieldName] = fieldValue;
+											}
+
+											// Формируем insert запрос
+											command.CommandText = FillInsertCommand(tableName.ToLower(), record);
+											command.ExecuteNonQuery();
+										}
+									}
+								}
+
+								timer.Stop();
+								Console.WriteLine($"Импорт данных таблицы {tableName} выполнен успешно. Время импорта составило: {timer.Elapsed}.");
+							}
 						}
-
-						var sql = GenerateInsertStatement("ADDROBJ", dict);
-						dict.Clear();
-
-						command.CommandText = sql;
-						var rows = command.ExecuteNonQuery();
-						count += rows;
-						Console.WriteLine($"ROWS: {count.ToString()}");
-
-						// Move the reader back to the element node.
-						reader.MoveToElement();
 					}
 				}
-
-				//Console.WriteLine(result);
 			}
-			
-			conn.Close();
-			Console.WriteLine("END");
+			catch (Exception ex)
+			{
+				Console.ForegroundColor = ConsoleColor.Red;
+				Console.WriteLine($"Критическая ошибка при выполнени импорта данных по ФИАС. Процесс импорта полностью остановлен. {ex.Message}.");
+			}
+
 			Console.ReadLine();
+		}
+
+		/// <summary>
+		/// Метод формирования строки добавления записи фиас в таблицу
+		/// </summary>
+		/// <param name="tableName"></param>
+		/// <param name="data"></param>
+		/// <returns></returns>
+		private static string FillInsertCommand(string tableName, Dictionary<string, object> data)
+		{
+			string sql = @"INSERT INTO public.{0} ({1}) VALUES ({2})";
+
+			// Дата создания записи
+			var createDate = $"'{DateTime.UtcNow.ToString("o")}'";
+
+			data["reccreated"] = createDate;
+			data["recupdated"] = createDate;
+			data["recstate"] = 1;
+
+			sql = string.Format(sql, tableName,
+				string.Join(',', data.Keys).ToLower(),
+				string.Join(',', data.Values).ToLower()
+			);
+
+			return sql;
 		}
 	}
 }
