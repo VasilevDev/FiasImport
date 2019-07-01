@@ -88,7 +88,7 @@ namespace FiasImport
 											while (reader.MoveToNextAttribute())
 											{
 												string fieldName = reader.Name.ToLower();
-												string fieldValue = $"'{reader.Value.ToLower()}'";
+												string fieldValue = $"'{reader.Value.Replace("'", "").Replace('«', '"').Replace('»', '"')}'";
 
 												record[fieldName] = fieldValue;
 											}
@@ -106,11 +106,14 @@ namespace FiasImport
 						}
 					}
 				}
+
+				Console.WriteLine("Импорт базы ФИАС выполнен успешно!");
 			}
 			catch (Exception ex)
 			{
 				Console.ForegroundColor = ConsoleColor.Red;
 				Console.WriteLine($"Критическая ошибка при выполнени импорта данных по ФИАС. Процесс импорта полностью остановлен. {ex.Message}.");
+				Console.ForegroundColor = ConsoleColor.White;
 			}
 
 			Console.ReadLine();
@@ -135,7 +138,7 @@ namespace FiasImport
 
 			sql = string.Format(sql, tableName,
 				string.Join(',', data.Keys).ToLower(),
-				string.Join(',', data.Values).ToLower()
+				string.Join(',', data.Values)
 			);
 
 			return sql;
