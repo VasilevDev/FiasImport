@@ -73,18 +73,19 @@ namespace FiasImport
 
 								var timer = new Stopwatch();
 								timer.Start();
+								int recordCount = 0;
 
 								// Цикл обхода XML файла ФИАС
 								while (reader.Read())
 								{
 									if (reader.NodeType == XmlNodeType.Element)
 									{
-										// Атрибуты и их значения представляют собой название поля в таблице и значение соответственно
+										//Атрибуты и их значения представляют собой название поля в таблице и значение соответственно
 										if (reader.HasAttributes)
 										{
 											var record = new Dictionary<string, object>();
 
-											// Цикл обхода всех полей записи таблицы
+											//Цикл обхода всех полей записи таблицы
 											while (reader.MoveToNextAttribute())
 											{
 												string fieldName = reader.Name.ToLower();
@@ -93,15 +94,44 @@ namespace FiasImport
 												record[fieldName] = fieldValue;
 											}
 
-											// Формируем insert запрос
-											command.CommandText = FillInsertCommand(tableName.ToLower(), record);
-											command.ExecuteNonQuery();
+											var actstatus = record["actstatus"].ToString().Replace("'", ""); // статус актуальности ФИАС
+											var currstatus = record["currstatus"].ToString().Replace("'", ""); // статус актуальности КЛАДР
+
+											//Пишем в БД только актуальные адресные объекты, actstatus == 1 и currstatus == 0
+											if (tableName.ToLower() == "addrobj" && int.Parse(actstatus) == 1 && int.Parse(currstatus) == 0)
+											{
+												//Формируем insert запрос
+												command.CommandText = FillInsertCommand(tableName.ToLower(), record);
+												command.ExecuteNonQuery();
+												recordCount++;
+											}
 										}
 									}
 								}
 
 								timer.Stop();
-								Console.WriteLine($"Импорт данных таблицы {tableName} выполнен успешно. Время импорта составило: {timer.Elapsed}.");
+
+								Console.WriteLine($"Импорт данных таблицы {tableName} выполнен успешно. Время импорта составило: {timer.Elapsed}. Импортировано {recordCount} записей.");
+
+								// Если это табличка адресов, то рассчитаем полный адрес для нужных записей
+								if (tableName.ToLower() == "addrobj")
+								{
+									var t = new Stopwatch();
+
+									try
+									{
+										Console.WriteLine($"Выполняем рассчет полного адреса для каждого адресного объекта");
+										t.Start();
+										int updRowCount = CalculateAndUpdateFullAddress(args[1]);
+										t.Stop();
+										Console.WriteLine($"Рассчитали полный адрес для {updRowCount} записей. С момента начала вычисления прошло: {t.Elapsed}.");
+									}
+									catch(Exception ex)
+									{
+										t.Stop();
+										throw new Exception($"Ошибка при вычислении полных адресов. Время, прошедшее с момента запуска: {t.Elapsed}. Ошибка: {ex.Message}.");
+									}
+								}
 							}
 						}
 					}
@@ -132,16 +162,43 @@ namespace FiasImport
 			// Дата создания записи
 			var createDate = $"'{DateTime.UtcNow.ToString("o")}'";
 
+			data["recid"] = $"'{Guid.NewGuid()}'";
 			data["reccreated"] = createDate;
 			data["recupdated"] = createDate;
 			data["recstate"] = 1;
 
-			sql = string.Format(sql, tableName,
+			sql = string.Format(sql, "rdev___fias_addrobj",
 				string.Join(',', data.Keys).ToLower(),
 				string.Join(',', data.Values)
 			);
 
 			return sql;
+		}
+	
+		/// <summary>
+		/// Рассчет полных адресов ФИАС
+		/// </summary>
+		/// <param name="connectionString"></param>
+		/// <returns>Количество обновленных записей</returns>
+		private static int CalculateAndUpdateFullAddress(string connectionString)
+		{
+			var connection = new NpgsqlConnection(connectionString);
+
+			try
+			{
+				using (var command = new NpgsqlCommand("UPDATE rdev___fias_addrobj ao SET fulladdress = get_addrobj_fulladdress(ao.aoguid) WHERE ao.recstate = 1"))
+				{
+					connection.Open();
+					command.Connection = connection;
+
+					int count = command.ExecuteNonQuery();
+					return count;
+				}
+			}
+			finally
+			{
+				connection.Close();
+			}
 		}
 	}
 }
