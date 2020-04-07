@@ -18,15 +18,17 @@ namespace FiasImport
 		/// args[0] - Путь к файлу архива с XML файлами данных по ФИАС
 		/// args[1] - Строка подключения к БД
 		/// args[2] - Строка со списком названий таблиц перечисленных через запятую
+		/// args[3] - onlyCalcAddress - если указан этот параметр, то произойдет только рассчет адреса в уже существующих данных. Вставки данных не будет.
 		/// </param>
 		static void Main(string[] args)
 		{
 			try
 			{
-				if (args == null || args.Length != 3)
+				if (args == null || args.Length < 3)
 					throw new ArgumentException("Количество параметров не соответствует ожидаемому. " +
 						"Ожидалось три параметра: 1- Путь к архиву справочника, 2 - Строка подключения к БД, " +
-						"3 - Список названий таблиц, в которые необходимо импортировать данные");
+						"3 - Список названий таблиц, в которые необходимо импортировать данные, " +
+						"4 - опционально onlyCalcAddress");
 
 				// Путь до архива с файлами данных по ФИАС
 				string fiasArchivePath = args[0];
@@ -44,97 +46,115 @@ namespace FiasImport
 				if (!tables.Any())
 					throw new ArgumentNullException("Список таблиц для импорта данных - пуст");
 
-				using (var connection = new NpgsqlConnection(args[1]))
-				using (var command = new NpgsqlCommand())
+				var onlyCalcAddress = false;
+				if (args.Length == 4 && args[3].ToLower() == "onlycalcaddress")
+					onlyCalcAddress = true;
+
+				if (!onlyCalcAddress)
 				{
-					connection.Open();
-					command.Connection = connection;
-
-					// Открываем архив с файлами данных по ФИАС
-					using (var archive = ArchiveFactory.Open(fiasArchivePath))
+					using (var connection = new NpgsqlConnection(args[1]))
+					using (var command = new NpgsqlCommand())
 					{
-						// Цикл обхода архива с XML файлами с данными ФИАС
-						foreach (var entry in archive.Entries)
+						connection.Open();
+						command.Connection = connection;
+
+
+						// Открываем архив с файлами данных по ФИАС
+						using (var archive = ArchiveFactory.Open(fiasArchivePath))
 						{
-							// Название таблицы полученное из название файла
-							// Например файл называется AS_ADDROBJ_20171217_33bb6037-d55f-49e1-bb44-b24e834a7ff5.XML
-							// из него получаем ADDROBJ
-							string tableName = entry.Key.Split('_')[1];
-
-							// Импортируем только нужные таблицы
-							if (!tables.Contains(tableName)) continue;
-
-							// Открываем поток на чтение XML файла ФИАС
-							using (var stream = entry.OpenEntryStream())
+							// Цикл обхода архива с XML файлами с данными ФИАС
+							foreach (var entry in archive.Entries)
 							{
-								XmlReader reader = XmlReader.Create(stream);
+								// Название таблицы полученное из название файла
+								// Например файл называется AS_ADDROBJ_20171217_33bb6037-d55f-49e1-bb44-b24e834a7ff5.XML
+								// из него получаем ADDROBJ
+								string tableName = entry.Key.Split('_')[1];
 
-								Console.WriteLine($"Запущен процесс импорта таблицы {tableName}");
+								// Импортируем только нужные таблицы
+								if (!tables.Contains(tableName)) continue;
 
-								var timer = new Stopwatch();
-								timer.Start();
-								int recordCount = 0;
-
-								// Цикл обхода XML файла ФИАС
-								while (reader.Read())
+								// Открываем поток на чтение XML файла ФИАС
+								using (var stream = entry.OpenEntryStream())
 								{
-									if (reader.NodeType == XmlNodeType.Element)
+									XmlReader reader = XmlReader.Create(stream);
+
+									Console.WriteLine($"Запущен процесс импорта таблицы {tableName}");
+
+									var timer = new Stopwatch();
+									timer.Start();
+									int recordCount = 0;
+
+									// Цикл обхода XML файла ФИАС
+									while (reader.Read())
 									{
-										//Атрибуты и их значения представляют собой название поля в таблице и значение соответственно
-										if (reader.HasAttributes)
+										if (reader.NodeType == XmlNodeType.Element)
 										{
-											var record = new Dictionary<string, object>();
-
-											//Цикл обхода всех полей записи таблицы
-											while (reader.MoveToNextAttribute())
+											//Атрибуты и их значения представляют собой название поля в таблице и значение соответственно
+											if (reader.HasAttributes)
 											{
-												string fieldName = reader.Name.ToLower();
-												string fieldValue = $"'{reader.Value.Replace("'", "").Replace('«', '"').Replace('»', '"')}'";
+												var record = new Dictionary<string, object>();
 
-												record[fieldName] = fieldValue;
-											}
+												//Цикл обхода всех полей записи таблицы
+												while (reader.MoveToNextAttribute())
+												{
+													string fieldName = reader.Name.ToLower();
+													string fieldValue = $"'{reader.Value.Replace("'", "").Replace('«', '"').Replace('»', '"')}'";
 
-											var actstatus = record["actstatus"].ToString().Replace("'", ""); // статус актуальности ФИАС
-											var currstatus = record["currstatus"].ToString().Replace("'", ""); // статус актуальности КЛАДР
+													record[fieldName] = fieldValue;
+												}
 
-											//Пишем в БД только актуальные адресные объекты, actstatus == 1 и currstatus == 0
-											if (tableName.ToLower() == "addrobj" && int.Parse(actstatus) == 1 && int.Parse(currstatus) == 0)
-											{
-												//Формируем insert запрос
-												command.CommandText = FillInsertCommand(tableName.ToLower(), record);
-												command.ExecuteNonQuery();
-												recordCount++;
+												var actstatus = record["actstatus"].ToString().Replace("'", ""); // статус актуальности ФИАС
+												if (string.IsNullOrEmpty(record["currstatus"].ToString()) || record["currstatus"].ToString() == "''")
+													record["currstatus"] = "'0'";
+												if (string.IsNullOrEmpty(record["operstatus"].ToString()) || record["operstatus"].ToString() == "''")
+													record["operstatus"] = "'0'";
+
+												var currstatus = record["currstatus"].ToString().Replace("'", ""); // статус актуальности КЛАДР
+
+												//Пишем в БД только актуальные адресные объекты, actstatus == 1 и currstatus == 0
+												if (tableName.ToLower() == "addrobj" && int.Parse(actstatus) == 1 && int.Parse(currstatus) == 0)
+												{
+													//Формируем insert запрос
+													command.CommandText = FillInsertCommand(tableName.ToLower(), record);
+													try
+													{
+														command.ExecuteNonQuery();
+													}
+													catch (Exception ex)
+													{
+														throw new Exception($"Ошибка вставки в таблицу {tableName.ToLower()}", ex);
+													}
+													recordCount++;
+												}
 											}
 										}
 									}
-								}
 
-								timer.Stop();
+									timer.Stop();
 
-								Console.WriteLine($"Импорт данных таблицы {tableName} выполнен успешно. Время импорта составило: {timer.Elapsed}. Импортировано {recordCount} записей.");
+									Console.WriteLine($"Импорт данных таблицы {tableName} выполнен успешно. Время импорта составило: {timer.Elapsed}. Импортировано {recordCount} записей.");
 
-								// Если это табличка адресов, то рассчитаем полный адрес для нужных записей
-								if (tableName.ToLower() == "addrobj")
-								{
-									var t = new Stopwatch();
-
-									try
-									{
-										Console.WriteLine($"Выполняем рассчет полного адреса для каждого адресного объекта");
-										t.Start();
-										int updRowCount = CalculateAndUpdateFullAddress(args[1]);
-										t.Stop();
-										Console.WriteLine($"Рассчитали полный адрес для {updRowCount} записей. С момента начала вычисления прошло: {t.Elapsed}.");
-									}
-									catch(Exception ex)
-									{
-										t.Stop();
-										throw new Exception($"Ошибка при вычислении полных адресов. Время, прошедшее с момента запуска: {t.Elapsed}. Ошибка: {ex.Message}.");
-									}
 								}
 							}
 						}
 					}
+				}
+
+				// Перерассчет полного адреса для таблички адресов
+				var t = new Stopwatch();
+
+				try
+				{
+					Console.WriteLine($"Выполняем рассчет полного адреса для каждого адресного объекта");
+					t.Start();
+					int updRowCount = CalculateAndUpdateFullAddress(args[1]);
+					t.Stop();
+					Console.WriteLine($"Рассчитали полный адрес для {updRowCount} записей. С момента начала вычисления прошло: {t.Elapsed}.");
+				}
+				catch (Exception ex)
+				{
+					t.Stop();
+					throw new Exception($"Ошибка при вычислении полных адресов. Время, прошедшее с момента запуска: {t.Elapsed}. Ошибка: {ex.Message}.");
 				}
 
 				Console.WriteLine("Импорт базы ФИАС выполнен успешно!");
@@ -146,7 +166,8 @@ namespace FiasImport
 				Console.ForegroundColor = ConsoleColor.White;
 			}
 
-			Console.ReadLine();
+			Console.WriteLine("Нажмите любую клавишу для завершения работы программы...");
+			Console.ReadKey();
 		}
 
 		/// <summary>
@@ -174,7 +195,7 @@ namespace FiasImport
 
 			return sql;
 		}
-	
+
 		/// <summary>
 		/// Рассчет полных адресов ФИАС
 		/// </summary>
@@ -194,6 +215,11 @@ namespace FiasImport
 					int count = command.ExecuteNonQuery();
 					return count;
 				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Ошибка при вычислении полных адресов. Ошибка: {ex.Message}.");
+				return -1;
 			}
 			finally
 			{
