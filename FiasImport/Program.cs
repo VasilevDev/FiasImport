@@ -6,6 +6,7 @@ using SharpCompress.Archives;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace FiasImport
 {
@@ -47,10 +48,14 @@ namespace FiasImport
 					throw new ArgumentNullException("Список таблиц для импорта данных - пуст");
 
 				var onlyCalcAddress = false;
+				var onlyCalcLexem = false;
+
 				if (args.Length == 4 && args[3].ToLower() == "onlycalcaddress")
 					onlyCalcAddress = true;
+				else if (args.Length == 4 && args[3].ToLower() == "onlycalclexem")
+					onlyCalcLexem = true;
 
-				if (!onlyCalcAddress)
+				if (!onlyCalcAddress && !onlyCalcLexem)
 				{
 					using (var connection = new NpgsqlConnection(args[1]))
 					using (var command = new NpgsqlCommand())
@@ -138,26 +143,40 @@ namespace FiasImport
 							}
 						}
 					}
+
+					Console.WriteLine("Импорт базы ФИАС выполнен успешно!");
 				}
 
-				// Перерассчет полного адреса для таблички адресов
-				var t = new Stopwatch();
+				if (!onlyCalcLexem)
+				{
+					// Перерассчет полного адреса для таблички адресов
+					var t = new Stopwatch();
+
+					try
+					{
+						Console.WriteLine($"Выполняем рассчет полного адреса для каждого адресного объекта");
+						t.Start();
+						int updRowCount = CalculateAndUpdateFullAddress(args[1]);
+						t.Stop();
+						Console.WriteLine($"Рассчитали полный адрес для {updRowCount} записей. С момента начала вычисления прошло: {t.Elapsed}.");
+					}
+					catch (Exception ex)
+					{
+						t.Stop();
+						throw new Exception($"Ошибка при вычислении полных адресов. Время, прошедшее с момента запуска: {t.Elapsed}. Ошибка: {ex.Message}.");
+					}
+				}
 
 				try
 				{
-					Console.WriteLine($"Выполняем рассчет полного адреса для каждого адресного объекта");
-					t.Start();
-					int updRowCount = CalculateAndUpdateFullAddress(args[1]);
-					t.Stop();
-					Console.WriteLine($"Рассчитали полный адрес для {updRowCount} записей. С момента начала вычисления прошло: {t.Elapsed}.");
+					CalculateAndUpdateFullAddressSearch(args[1]);
 				}
-				catch (Exception ex)
+				catch(Exception ex)
 				{
-					t.Stop();
-					throw new Exception($"Ошибка при вычислении полных адресов. Время, прошедшее с момента запуска: {t.Elapsed}. Ошибка: {ex.Message}.");
+					throw new Exception($"Ошибка при вычислении лексем. {ex.Message}");
 				}
 
-				Console.WriteLine("Импорт базы ФИАС выполнен успешно!");
+				
 			}
 			catch (Exception ex)
 			{
@@ -207,7 +226,7 @@ namespace FiasImport
 
 			try
 			{
-				using (var command = new NpgsqlCommand("UPDATE rdev___fias_addrobj ao SET fulladdress = get_addrobj_fulladdress(ao.aoguid) WHERE ao.recstate = 1"))
+				using (var command = new NpgsqlCommand("UPDATE rdev___fias_addrobj ao SET fulladdress = get_addrobj_fulladdress(ao.aoguid)"))
 				{
 					connection.Open();
 					command.Connection = connection;
@@ -226,5 +245,176 @@ namespace FiasImport
 				connection.Close();
 			}
 		}
+
+		#region Разбиение полного адреса на фрагменты
+
+		private static void CalculateAndUpdateFullAddressSearch(string connectionString)
+		{
+			var stop = new Stopwatch();
+
+			try
+			{
+				Console.WriteLine($"Выполняем рассчет лексем на основе полного адреса");
+
+				stop.Start();
+
+				while (true)
+				{
+					var records = GetRecords(connectionString);
+					if (records.Count() <= 0)
+					{
+						Console.WriteLine("Список записей для обработки пуст.");
+						break;
+					}
+					else
+					{
+						// Разбиваем адрес на фрагменты
+						var updRecords = new Dictionary<Guid, string>();
+						foreach (var record in records)
+						{
+							var fasValue = ParseAddressString(record.Value);
+							updRecords.Add(record.Key, fasValue);
+						}
+
+						UpdateRecords(connectionString, updRecords);
+					}
+				}
+			}
+			catch(Exception ex)
+			{
+				Console.WriteLine($"Критическая ошибка при рассчете лексем. Message: {ex.Message}. InnerMessage: {ex.InnerException.Message}");
+			}
+			finally
+			{
+				stop.Stop();
+			}
+
+			Console.WriteLine($"Рассчет лексем закончен: длительность составила {stop.Elapsed}");
+		}
+
+		static Dictionary<Guid, string> GetRecords(string connectionString)
+		{
+			var records = new Dictionary<Guid, string>();
+
+			using (var connection = new NpgsqlConnection(connectionString))
+			{
+				connection.Open();
+				using (var cmd = new NpgsqlCommand())
+				{
+					cmd.Connection = connection;
+					cmd.CommandText = "select recid, fulladdress from rdev___fias_addrobj where fulladdress_search IS NULL limit 20";
+
+					var reader = cmd.ExecuteReader();
+
+					while (reader.Read())
+						records.Add(Guid.Parse(reader[0].ToString()), reader[1].ToString());
+				}
+			}
+
+			return records;
+		}
+
+		static string ParseAddressString(string fullAddress)
+		{
+			var addressParts = fullAddress.Split(',');
+			var sb = new StringBuilder();
+
+			foreach (var addressPart in addressParts)
+			{
+				string part = addressPart.Replace(',', ' ');
+				part = part.Trim();
+				part = part.ToLower();
+				//part = RemoveStopWords(part);
+				part = DivideWord(part);
+
+				sb.Append(part);
+				sb.Append(" ");
+			}
+
+			return RemoveDublicate(sb.ToString().Trim());
+		}
+
+		static string DivideWord(string phrase)
+		{
+			phrase = phrase.Replace('.', ' ');
+			phrase = phrase.Trim();
+			var phraseParts = phrase.Split(' ');
+
+			var sb = new StringBuilder();
+
+			foreach (var phrasePart in phraseParts)
+			{
+				var part = phrasePart.Trim();
+				int wordSymbolCount = part.Length;
+
+				var sb2 = new StringBuilder();
+
+				if (wordSymbolCount <= 3)
+				{
+					sb.Append($"{part} ");
+				}
+				else
+				{
+					for (int i = 0; i < wordSymbolCount; i++)
+					{
+						var lexema = part.Substring(0, i + 1);
+
+						if (lexema.Length > 1)
+							sb2.Append($"{part.Substring(0, i + 1)} ");
+					}
+
+					sb.Append(sb2.ToString());
+				}
+			}
+
+			return sb.ToString().Trim();
+		}
+
+		static string RemoveDublicate(string s)
+		{
+			var parts = s.Split(" ").Reverse<string>();
+
+			var sb = new StringBuilder();
+			var localParts = parts.ToList<string>();
+
+			foreach (var part in parts)
+			{
+				int counter = 0;
+
+				foreach (var item in localParts)
+				{
+					if (item == part) counter++;
+				}
+
+				if (counter > 1)
+					localParts.Remove(part);
+			}
+
+			sb.AppendJoin(" ", localParts.Reverse<string>());
+			return sb.ToString().Trim();
+		}
+
+		static int UpdateRecords(string connectionString, Dictionary<Guid, string> updRecords)
+		{
+			using (var connection = new NpgsqlConnection(connectionString))
+			{
+				connection.Open();
+				using (var cmd = new NpgsqlCommand())
+				{
+					cmd.Connection = connection;
+
+					int countUpdRecord = 0;
+					foreach (var updRecord in updRecords)
+					{
+						cmd.CommandText = $"update rdev___fias_addrobj set fulladdress_search = '{updRecord.Value}' where recid = '{updRecord.Key}'";
+						countUpdRecord += cmd.ExecuteNonQuery();
+					}
+
+					return countUpdRecord;
+				}
+			}
+		}
+
+		#endregion
 	}
 }
