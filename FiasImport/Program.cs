@@ -121,14 +121,16 @@ namespace FiasImport
 												{
 													//Формируем insert запрос
 													command.CommandText = FillInsertCommand(tableName.ToLower(), record);
+
 													try
 													{
 														command.ExecuteNonQuery();
 													}
 													catch (Exception ex)
 													{
-														throw new Exception($"Ошибка вставки в таблицу {tableName.ToLower()}", ex);
+														throw new Exception($"Ошибка вставки в таблицу {tableName.ToLower()}. {ex.Message}");
 													}
+
 													recordCount++;
 												}
 											}
