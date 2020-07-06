@@ -109,9 +109,9 @@ namespace FiasImport
 												}
 
 												var actstatus = record["actstatus"].ToString().Replace("'", ""); // статус актуальности ФИАС
-												if (string.IsNullOrEmpty(record["currstatus"].ToString()) || record["currstatus"].ToString() == "''")
+												if (string.IsNullOrEmpty(record["currstatus"]?.ToString()) || record["currstatus"]?.ToString() == "''")
 													record["currstatus"] = "'0'";
-												if (string.IsNullOrEmpty(record["operstatus"].ToString()) || record["operstatus"].ToString() == "''")
+												if (string.IsNullOrEmpty(record["operstatus"]?.ToString()) || record["operstatus"]?.ToString() == "''")
 													record["operstatus"] = "'0'";
 
 												var currstatus = record["currstatus"].ToString().Replace("'", ""); // статус актуальности КЛАДР
